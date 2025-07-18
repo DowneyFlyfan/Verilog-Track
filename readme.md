@@ -4,24 +4,34 @@
 
 ## 流水线卷积状态机
 
-1. 怎么打pad?
+### 设计
 
 - 128位输入是可以扩的
 
 state:
-0: IDLE
-1: READ: 开始读buffer, 上面打pad, 左右打pad
-2: SIDE_CONV: 两侧卷积, 一次数据读入长度凑不够卷积长度, 就把两侧的都卷了来弥补这个长度
-3: MIDDLE_CONV: 中间卷积
+IDLE: 全部归0
+READ: 开始读buffer, 上面打pad, 左右打pad
+MIDDLE_CONV: 中间卷积
+BOTTOM_CONV: 底部卷积, 全部打0
 
-IDLE -> ~add_en, read_en -> READ
-READ -> add_en  -> SIDE_CONV
-SIDE_CONV -> (w_idx = PAD_SIZE -> middle_en) -> MIDDLE_CONV
-SIDE_CONV -> ~add_en -> READ
-MIDDLE_CONV -> ~middle_en -> SIDE_CONV
+- IDLE -> conv_en -> READ, or IDLE
+
+- READ -> add_en -> MIDDLE_CONV, or READ
+
+- MIDDLE_CONV -> bottom_en -> BOTTOM_CONV
+
+- BOTTOM_CONV -> ~bottom_en -> MIDDLE_CONV, ~add_en -> READ
+
+### Debug
+
+- 看总体 √
+
+- 状态机转换
+
+- 输出状态有效
+
+- 检查adder_tree √
 
 ## Sobel
-
-- 一次性读入128 bit数
 
 ## Hessian矩阵

@@ -1,37 +1,42 @@
-// WARN:目前只考虑ROI_SIZE是NUM_PER_CYCLE的整数倍
+// WARN:目前只考虑ROI_SIZE是NUM_PER_CYCLE的整数倍 
+// WARN:有符号数和无符号数的转换
+// NOTE: Reset 和 IDLE 都是指整个过程开始前和结束后的重置
+
 module convolution_core #(
     parameter ROI_SIZE = 480,
     parameter PORT_BITS = 128,
     parameter IN_WIDTH = 8,
     parameter KERNEL_SIZE = 3,
     parameter KERNEL_DATA_WIDTH = 4,
-    parameter KERNEL_NUM = 3,
-    parameter CHANNEL_ADD_VLD = 1,
-    parameter NUM_PER_CYCLE = PORT_BITS / IN_WIDTH
+    parameter KERNEL_NUM = 2,
+    parameter CHANNEL_ADD_VLD = 1
 ) (
     input clk,
     input rst_n,
     input clk_en,
     input conv_en,
-    input logic signed [PORT_BITS - 1:0] data_in,
+    input logic [PORT_BITS - 1:0] data_in,
     input logic signed [KERNEL_DATA_WIDTH - 1:0] kernel[KERNEL_NUM-1:0][KERNEL_SIZE-1:0][KERNEL_SIZE-1:0],
     output logic signed [OUT_WIDTH-1:0] data_out[KERNEL_NUM-1:0][NUM_PER_CYCLE - 1:0],
-    output logic data_out_vld
+    output logic conv_out_vld
 );
 
   // Params
   localparam KERNEL_AREA = KERNEL_SIZE * KERNEL_SIZE;
+  localparam KERNEL_SIZE_MINUS_1 = KERNEL_SIZE - 1;
+
   localparam PAD_SIZE = (KERNEL_SIZE - 1) / 2;
-
   localparam BUF_WIDTH = ROI_SIZE + 2 * PAD_SIZE;
-  localparam BUF_SIZE = BUF_WIDTH * KERNEL_SIZE;
-  localparam PAD_AREA = PAD_SIZE * BUF_WIDTH;
 
-  localparam FLAG_BITS = $clog2(KERNEL_SIZE);
   localparam HW_BITS = $clog2(ROI_SIZE);
-  localparam BUF_BITS = $clog2(BUF_SIZE);
-  localparam HEIGHT_BITS = $clog2(BUF_WIDTH * KERNEL_SIZE);
+  localparam BUF_WIDTH_BITS = $clog2(BUF_WIDTH);
+  localparam KERNEL_BITS = $clog2(KERNEL_SIZE);
 
+  localparam FIRST_RIGHT_PAD_IDX = ROI_SIZE + PAD_SIZE;
+  localparam IMG_RIGHT_KERNEL_IDX = BUF_WIDTH - PAD_SIZE - KERNEL_SIZE;
+  localparam CONV_MAT_RIGHT_IDX = NUM_PER_CYCLE - PAD_SIZE;
+
+  localparam NUM_PER_CYCLE = PORT_BITS / IN_WIDTH;
   localparam MULTIPLIED_WIDTH = IN_WIDTH + KERNEL_DATA_WIDTH;
   localparam OUT_WIDTH = (CHANNEL_ADD_VLD == 1) ? (MULTIPLIED_WIDTH + $clog2(
       KERNEL_AREA * KERNEL_NUM
@@ -40,57 +45,48 @@ module convolution_core #(
   ));
 
   // Buffers, Conv Matrix, Zeros
-  logic signed [IN_WIDTH - 1:0] buffer[BUF_SIZE-1:0];
-  logic signed [HEIGHT_BITS-1:0] BUF_WIDTH_MAT[KERNEL_SIZE-1:0];
-  logic signed [MULTIPLIED_WIDTH-1:0] conv_mat[NUM_PER_CYCLE-1:0][KERNEL_NUM-1:0][KERNEL_AREA-1:0];
+  logic signed [IN_WIDTH - 1:0] buffer[KERNEL_SIZE-1:0][BUF_WIDTH-1:0];
+  logic signed [MULTIPLIED_WIDTH-1:0] conv_mat[NUM_PER_CYCLE-1:0][KERNEL_NUM-1:0][KERNEL_SIZE-1:0][KERNEL_SIZE-1:0];
   logic [PORT_BITS-1:0] zeros = 0;
+  logic [MULTIPLIED_WIDTH-1:0] unknowns = 'x;
 
   // Indices
-  logic [BUF_SIZE- 1:0] buf_idx, next_buf_idx;
-  logic [HW_BITS-1:0] w_idx, h_idx, next_h_idx;  // Index for Conv Kernel on Top Left
-  logic [FLAG_BITS-1:0] buf_flag;
+  logic [BUF_WIDTH_BITS - 1:0] buf_w;
+  logic [KERNEL_BITS-1:0] buf_h;
+  logic [HW_BITS-1:0] conv_w, conv_h;  // Index for Conv Kernel on Top Left
 
   // State Machine
   localparam IDLE = 4'b1;
   localparam READ = 4'b10;
-  localparam SIDE_CONV = 4'b100;
-  localparam MIDDLE_CONV = 4'b1000;
+  localparam MIDDLE_CONV = 4'b100;
+  localparam BOTTOM_CONV = 4'b1000;
   reg [3:0] n_state;
   reg [3:0] c_state;
 
   // Enable Signals
   logic add_en;
-  logic read_en;
-  logic middle_en;
+  logic bottom_en;
 
   // Latency
   localparam ADDER_LATENCY = (CHANNEL_ADD_VLD == 1) ? ($clog2(
       KERNEL_AREA * KERNEL_NUM
-  ) + 1) : ($clog2(
+  ) + 2) : ($clog2(
       KERNEL_AREA
-  ) + 1);
+  ) + 2);
   logic [ADDER_LATENCY-1:0] add_out_en;
 
-  genvar h;
-  generate
-    for (h = 0; h < KERNEL_SIZE; h = h + 1) begin
-      assign BUF_WIDTH_MAT[h] = h * BUF_WIDTH;
-    end
-  endgenerate
-
   // TODO: MAYBE Optimize Adder Tree for this task
-  genvar n, ka, kn;  // NUM_PER_CYCLE, KERNEL_AREA, KERNEL_NUM
+  genvar n, kn, ka;  // NUM_PER_CYCLE, KERNEL_NUM, KERNEL_AREA
   generate
     if (CHANNEL_ADD_VLD) begin
       localparam INPUT_NUM = KERNEL_AREA * KERNEL_NUM;
-
       logic signed [INPUT_NUM*MULTIPLIED_WIDTH-1:0] adder_tree_input[NUM_PER_CYCLE-1:0];
       logic signed [OUT_WIDTH-1:0] adder_tree_output[NUM_PER_CYCLE-1:0];
 
       for (n = 0; n < NUM_PER_CYCLE; n = n + 1) begin
         for (kn = 0; kn < KERNEL_NUM; kn = kn + 1) begin
           for (ka = 0; ka < KERNEL_AREA; ka = ka + 1) begin
-            assign adder_tree_input[n][(kn*KERNEL_AREA + (ka+1))*MULTIPLIED_WIDTH-1-:MULTIPLIED_WIDTH] = conv_mat[n][kn][ka];
+            assign adder_tree_input[n][(kn*KERNEL_AREA + (ka+1))*MULTIPLIED_WIDTH-1-:MULTIPLIED_WIDTH] = conv_mat[n][kn][ka/KERNEL_SIZE][ka%KERNEL_SIZE];
           end
         end
 
@@ -107,6 +103,7 @@ module convolution_core #(
         assign data_out[0][n] = adder_tree_output[n];
       end
     end else begin
+      // WARN:先不管
       localparam INPUT_NUM = KERNEL_AREA;
 
       logic signed [INPUT_NUM*MULTIPLIED_WIDTH-1:0] adder_tree_input[NUM_PER_CYCLE*KERNEL_NUM-1:0];
@@ -115,7 +112,7 @@ module convolution_core #(
       for (n = 0; n < NUM_PER_CYCLE; n = n + 1) begin
         for (kn = 0; kn < KERNEL_NUM; kn = kn + 1) begin
           for (ka = 0; ka < KERNEL_AREA; ka = ka + 1) begin
-            assign adder_tree_input[n*(kn+1)][(ka+1)*MULTIPLIED_WIDTH-1-:MULTIPLIED_WIDTH] = conv_mat[n][kn][ka];
+            assign adder_tree_input[(n+1)*(kn+1)-1][(ka+1)*MULTIPLIED_WIDTH-1-:MULTIPLIED_WIDTH] = conv_mat[n][kn][ka/KERNEL_SIZE][ka%KERNEL_SIZE];
           end
           adder_tree #(
               .INPUT_NUM(INPUT_NUM),
@@ -124,7 +121,7 @@ module convolution_core #(
               .clk(clk),
               .rst_n(rst_n),
               .add_en(add_en),
-              .din(adder_tree_input[n*(kn+1)]),
+              .din(adder_tree_input[(n+1)*(kn+1)-1]),
               .dout(adder_tree_output[kn][n])
           );
           assign data_out[kn][n] = adder_tree_output[kn][n];
@@ -133,27 +130,22 @@ module convolution_core #(
     end
   endgenerate
 
-  always @(posedge clk or negedge rst_n) begin
-    // TODO:Reset 和 IDLE 还需要斟酌
+  // Main Logic
+  always_ff @(posedge clk or negedge rst_n) begin
     if (~rst_n) begin
-      w_idx <= 0;
-      h_idx <= 0;
-      buf_flag <= 0;
-      buf_idx <= PAD_SIZE + BUF_WIDTH_MAT[PAD_SIZE];
+      conv_h <= 0;
+      conv_w <= 0;
+      buf_w <= PAD_SIZE;
+      buf_h <= PAD_SIZE;
 
       add_en <= 1'b0;
-      read_en <= 1'b1;
-      middle_en <= 1'b0;
-      add_out_en <= '0;
+      bottom_en <= 1'b0;
+      add_out_en <= 0;
 
-      for (int i = 0; i < PAD_AREA; i = i + 1) begin
-        buffer[i] <= '0;
-      end
-
-      for (int h = PAD_SIZE; h < KERNEL_SIZE; h = h + 1) begin
-        for (int w = 0; w < PAD_SIZE; w = w + 1) begin
-          buffer[h*BUF_WIDTH+w] <= '0;
-          buffer[(h+1)*BUF_WIDTH-w-1] <= '0;
+      // Pad Buffer Area With 0
+      for (int h = 0; h < KERNEL_SIZE; h = h + 1) begin
+        for (int w = 0; w < BUF_WIDTH; w = w + 1) begin
+          buffer[h][w] <= '0;
         end
       end
 
@@ -161,133 +153,124 @@ module convolution_core #(
       add_out_en <= {add_out_en[ADDER_LATENCY-2:0], add_en};
       case (c_state)
         IDLE: begin
-          w_idx <= 0;
-          h_idx <= 0;
-          buf_flag <= 0;
-          buf_idx <= PAD_SIZE + BUF_WIDTH_MAT[PAD_SIZE];
+          conv_h <= 0;
+          conv_w <= 0;
+          buf_w <= PAD_SIZE;
+          buf_h <= PAD_SIZE;
 
           add_en <= 1'b0;
-          read_en <= 1'b1;
-          middle_en <= 1'b0;
-          add_out_en <= '0;
+          bottom_en <= 1'b0;
+          add_out_en <= 0;
 
-          for (int i = 0; i < PAD_AREA; i = i + 1) begin
-            buffer[i] <= '0;
-          end
-
-          for (int h = PAD_SIZE; h < KERNEL_SIZE; h = h + 1) begin
-            for (int w = 0; w < PAD_SIZE; w = w + 1) begin
-              buffer[h*BUF_WIDTH+w] <= '0;
-              buffer[(h+1)*BUF_WIDTH-w-1] <= '0;
+          // Pad Buffer Area With 0
+          for (int h = 0; h < KERNEL_SIZE; h = h + 1) begin
+            for (int w = 0; w < BUF_WIDTH; w = w + 1) begin
+              buffer[h][w] <= '0;
             end
           end
         end
 
         READ: begin
-          if (read_en) begin
-            if (buf_idx >= BUF_SIZE - PAD_SIZE - 1) begin  // Done Reading, to FIRST_CONV
-              buf_idx <= PAD_SIZE;
-              read_en <= 1'b0;
-            end else begin
-              // Fill in the data
-              for (int i = 0; i < NUM_PER_CYCLE; i = i + 1) begin
-                buffer[buf_idx+i] <= data_in[(i+1)*IN_WIDTH-1-:IN_WIDTH];
-              end
-
-              next_buf_idx = buf_idx + NUM_PER_CYCLE;
-              for (int h = 0; h < KERNEL_SIZE; h = h + 1) begin
-                if (BUF_WIDTH_MAT[h] - PAD_SIZE == buf_idx) begin
-                  next_buf_idx = buf_idx + 2 * PAD_SIZE;
-                end
-              end
-              buf_idx <= next_buf_idx;
-            end
-          end
-        end
-
-        SIDE_CONV: begin
-          w_idx <= w_idx + NUM_PER_CYCLE;  // 换列
-          middle_en <= 1'b1;
-
-          for (int n = w_idx; n < w_idx + NUM_PER_CYCLE; n = n + 1) begin
-            for (int c = 0; c < KERNEL_NUM; c = c + 1) begin
-              for (int h = 0; h < KERNEL_SIZE; h = h + 1) begin
-                for (int w = 0; w < KERNEL_SIZE; w = w + 1) begin
-                  if (h + buf_flag >= KERNEL_SIZE) begin
-                    conv_mat[n-w_idx][c][h*KERNEL_SIZE+w] <= buffer[BUF_WIDTH_MAT[h]+n+w] * kernel[c][h+buf_flag-KERNEL_SIZE][w];
-                  end else begin
-                    conv_mat[n-w_idx][c][h*KERNEL_SIZE+w] <= buffer[BUF_WIDTH_MAT[h]+n+w] * kernel[c][h+buf_flag][w];
-                  end
-                end
-              end
-            end
+          // Read Data
+          for (int i = 0; i < NUM_PER_CYCLE; i = i + 1) begin
+            buffer[buf_h][buf_w+i] <= signed'(data_in[(i+1)*IN_WIDTH-1-:IN_WIDTH]);
           end
 
+          // Update Buffer Index
+          if (buf_w + NUM_PER_CYCLE == FIRST_RIGHT_PAD_IDX) begin  // Last Column of Buffer
+            buf_w <= PAD_SIZE;
+            buf_h <= buf_h + 1;
+          end else begin  // Normal Condition
+            buf_w <= buf_w + NUM_PER_CYCLE;
+          end
+
+          if (buf_h == KERNEL_SIZE - 1 && buf_w == NUM_PER_CYCLE + PAD_SIZE) begin  // delay = 2 cycles between conv and buf
+            add_en <= 1'b1;
+          end
         end
 
         MIDDLE_CONV: begin
-          add_en <= 1'b1;
-
-          if (h_idx < ROI_SIZE - KERNEL_SIZE + 1) begin
-            for (int i = 0; i < NUM_PER_CYCLE; i = i + 1) begin
-              if (w_idx + i < ROI_SIZE) begin  // Boundary check for writing
-                buffer[BUF_WIDTH_MAT[buf_flag] + w_idx + PAD_SIZE + i] <= data_in[(i + 1) * IN_WIDTH - 1 -: IN_WIDTH];
-              end
-            end
-          end else begin  // Pad with zeros at the bottom of the image
-            for (int i = 0; i < NUM_PER_CYCLE; i = i + 1) begin
-              if (w_idx + i < ROI_SIZE) begin
-                buffer[BUF_WIDTH_MAT[buf_flag]+w_idx+PAD_SIZE+i] <= '0;
-              end
-            end
+          // Update Buffer Index
+          if (buf_w + NUM_PER_CYCLE == FIRST_RIGHT_PAD_IDX) begin  // Last Column of Buffer
+            buf_w <= PAD_SIZE;
+            buf_h <= buf_h + 1;
+          end else begin  // Normal Condition
+            buf_w <= buf_w + NUM_PER_CYCLE;
           end
 
-          if (buf_idx == BUF_SIZE - 1 - PAD_SIZE) begin
-            buf_idx   <= PAD_SIZE;
-            middle_en <= 1'b0;
-          end else begin
-            // Buffer Index Updates - THIS LOGIC IS FLAWED FOR MIDDLE_CONV AND IS NOW SUPERSEDED BY THE LOGIC ABOVE
-            // The buf_idx is kept running to satisfy the end-of-row condition, but is not used for writing
-            next_buf_idx = buf_idx + NUM_PER_CYCLE;
-            for (int h = 0; h < KERNEL_SIZE; h = h + 1) begin
-              if (BUF_WIDTH_MAT[h] - PAD_SIZE == buf_idx) begin
-                next_buf_idx = buf_idx + 2 * PAD_SIZE;
-              end
-            end
-            buf_idx <= next_buf_idx;
+          // To bottom
+          if (buf_w + NUM_PER_CYCLE == FIRST_RIGHT_PAD_IDX && buf_h == IMG_RIGHT_KERNEL_IDX) begin  // Last Row of Buffer
+            bottom_en <= 1'b1;
           end
 
-          // H,W,Flag Index Updates
-          if (w_idx == ROI_SIZE - 1) begin  // 卷积核到最右边换行
-            middle_en <= 1'b0;  // 进入SIDE_CONV
-            buf_flag  <= buf_flag + 1'b1;  // buf_flag换行
-            if (buf_flag == KERNEL_SIZE) begin
-              buf_flag <= 0;
-            end
-            w_idx <= 0;  // w换行
-
-            // h换行
-            next_h_idx = h_idx + 1'b1;
-            if (next_h_idx == ROI_SIZE) begin  // 一张图已经搞定
-              h_idx  <= 0;
-              add_en <= 0;
-            end else begin
-              h_idx <= next_h_idx;
-            end
+          // Update Conv Index
+          if (conv_w + NUM_PER_CYCLE == ROI_SIZE) begin
+            conv_h <= conv_h + 1;
+            conv_w <= 0;
           end else begin
-            w_idx <= w_idx + NUM_PER_CYCLE;  // 换列
+            conv_w <= conv_w + NUM_PER_CYCLE;
+          end
+
+          // Read Data
+          for (int i = 0; i < NUM_PER_CYCLE; i = i + 1) begin
+            buffer[KERNEL_SIZE-1][buf_w+i] <= signed'(data_in[(i+1)*IN_WIDTH-1-:IN_WIDTH]);
+          end
+          for (int h = 0; h < KERNEL_SIZE - 1; h = h + 1) begin
+            for (int i = 0; i < NUM_PER_CYCLE; i = i + 1) begin
+              buffer[h][buf_w+i] <= buffer[h+1][buf_w+i];
+            end
           end
 
           // Conv
-          for (int n = w_idx; n < w_idx + NUM_PER_CYCLE; n = n + 1) begin
+          for (int n = conv_w; n < conv_w + NUM_PER_CYCLE; n = n + 1) begin
             for (int c = 0; c < KERNEL_NUM; c = c + 1) begin
               for (int h = 0; h < KERNEL_SIZE; h = h + 1) begin
                 for (int w = 0; w < KERNEL_SIZE; w = w + 1) begin
-                  if (h + buf_flag >= KERNEL_SIZE) begin
-                    conv_mat[n-w_idx][c][h*KERNEL_SIZE+w] <= buffer[BUF_WIDTH_MAT[h]+n+w] * kernel[c][h+buf_flag-KERNEL_SIZE][w];
-                  end else begin
-                    conv_mat[n-w_idx][c][h*KERNEL_SIZE+w] <= buffer[BUF_WIDTH_MAT[h]+n+w] * kernel[c][h+buf_flag][w];
-                  end
+                  conv_mat[n-conv_w][c][h][w] <= buffer[h][n+w] * kernel[c][h][w];
+                end
+              end
+            end
+          end
+
+        end
+
+        BOTTOM_CONV: begin
+          // Update Buffer Index
+          if (buf_w + NUM_PER_CYCLE == FIRST_RIGHT_PAD_IDX) begin  // Last Column of Buffer
+            buf_w <= PAD_SIZE;
+            buf_h <= buf_h + 1;
+          end else begin  // Normal Condition
+            buf_w <= buf_w + NUM_PER_CYCLE;
+          end
+
+          // Update Conv Index
+          if (conv_w + NUM_PER_CYCLE == ROI_SIZE) begin
+            conv_h <= conv_h + 1;
+          end else begin
+            conv_w <= conv_w + NUM_PER_CYCLE;
+          end
+
+          // To IDLE
+          if (conv_w + NUM_PER_CYCLE == ROI_SIZE && conv_h == ROI_SIZE - 1) begin
+            add_en <= 1'b0;
+          end
+
+          // Read Zeros
+          for (int i = 0; i < NUM_PER_CYCLE; i = i + 1) begin
+            buffer[KERNEL_SIZE-1][buf_w+i] <= signed'(zeros[(i+1)*IN_WIDTH-1-:IN_WIDTH]);
+          end
+          for (int h = 0; h < KERNEL_SIZE - 1; h = h + 1) begin
+            for (int i = 0; i < NUM_PER_CYCLE; i = i + 1) begin
+              buffer[h][buf_w+i] <= buffer[h+1][buf_w+i];
+            end
+          end
+
+          // Conv
+          for (int n = conv_w; n < conv_w + NUM_PER_CYCLE; n = n + 1) begin
+            for (int c = 0; c < KERNEL_NUM; c = c + 1) begin
+              for (int h = 0; h < KERNEL_SIZE; h = h + 1) begin
+                for (int w = 0; w < KERNEL_SIZE; w = w + 1) begin
+                  conv_mat[n-conv_w][c][h][w] <= buffer[h][n+w] * kernel[c][h][w];
                 end
               end
             end
@@ -298,7 +281,8 @@ module convolution_core #(
     end
   end
 
-  always @(posedge clk or negedge rst_n) begin
+  // State Machine Setting
+  always_ff @(posedge clk or negedge rst_n) begin
     if (~rst_n) begin
       c_state <= IDLE;
     end else if (clk_en) begin
@@ -306,22 +290,24 @@ module convolution_core #(
     end
   end
 
-  always @(*) begin
+  always_comb begin
     case (c_state)
       IDLE: begin
-        n_state = (conv_en && !add_en && read_en) ? READ : IDLE;
+        n_state = conv_en ? READ : IDLE;
       end
       READ: begin
-        n_state = conv_en ? (!read_en ? SIDE_CONV : READ) : IDLE;
-      end
-      SIDE_CONV: begin
-        n_state = conv_en ? MIDDLE_CONV : IDLE;
+        n_state = conv_en ? (add_en ? MIDDLE_CONV : READ) : IDLE;
       end
       MIDDLE_CONV: begin
-        n_state = conv_en ? (middle_en ? MIDDLE_CONV : SIDE_CONV) : IDLE;
+        n_state = conv_en ? (bottom_en ? BOTTOM_CONV : MIDDLE_CONV) : IDLE;
+      end
+      BOTTOM_CONV: begin
+        n_state = conv_en ? (add_en ? BOTTOM_CONV : IDLE) : IDLE;
       end
       default: n_state = IDLE;
     endcase
-    assign data_out_vld = add_out_en[ADDER_LATENCY-1];
+
+    assign conv_out_vld = add_out_en[ADDER_LATENCY-1];
   end
+
 endmodule

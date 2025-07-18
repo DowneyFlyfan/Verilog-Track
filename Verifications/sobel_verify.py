@@ -9,7 +9,7 @@ from utils import *
 
 class Tb_machine:
     def __init__(self):
-        self.roi_size = 480
+        self.roi_size = 48
         self.in_width = 8
         self.kernel_size = 3
         self.kernel_data_width = 4
@@ -23,32 +23,37 @@ class Tb_machine:
             + math.ceil(math.log2(self.adder_tree_input_num))
         )
 
-    def data_gen(self):
-        self.sobel_x = torch.tensor(
-            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.int16
-        )
-        self.sobel_y = torch.tensor(
-            [[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.int16
-        )
+    def data_gen(self, kernel_type="sobel"):
         self.image = torch.randint(
-            low=0,
-            high=255,
+            low=-128,
+            high=127,
             size=(1, 1, self.roi_size, self.roi_size),
-            dtype=torch.int16,
+            dtype=torch.int8,
         )
 
-        # Conv
-        conv_x = F.conv2d(
-            self.image,
-            self.sobel_x.view(1, 1, self.kernel_size, self.kernel_size),
-            padding=self.pad_size,
-        )
-        conv_y = F.conv2d(
-            self.image,
-            self.sobel_y.view(1, 1, self.kernel_size, self.kernel_size),
-            padding=self.pad_size,
-        )
-        self.expected_output = conv_x + conv_y
+        if kernel_type == "sobel":
+            self.sobel_x = torch.tensor(
+                [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.int8
+            )
+            self.sobel_y = torch.tensor(
+                [[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.int8
+            )
+
+            # Conv
+            conv_x = F.conv2d(
+                self.image,
+                self.sobel_x.view(1, 1, self.kernel_size, self.kernel_size),
+                padding=self.pad_size,
+            )
+            conv_y = F.conv2d(
+                self.image,
+                self.sobel_y.view(1, 1, self.kernel_size, self.kernel_size),
+                padding=self.pad_size,
+            )
+            self.expected_output = conv_x + conv_y
+
+        elif kernel_type == "hessian":
+            ...
 
     def write(self):
         write_to_file(self.image.numpy(), self.path + "input_img.txt", self.in_width)
@@ -93,14 +98,14 @@ class Tb_machine:
                 print("\n❌ Verification failed! The outputs do not match.")
                 difference = expected_output - verilog_output
                 print("\nDifference (Expected - Verilog):")
-                print(difference)
+                print(difference[0, 0, :20, :20])
 
         except Exception as e:
             print(f"\nAn error occurred while processing the output file: {e}")
 
-    def forward(self, way):
+    def forward(self, way, kernel_type="sobel"):
         if way == 1:
-            self.data_gen()
+            self.data_gen(kernel_type=kernel_type)
             self.write()
         elif way == 2:
             self.verification()

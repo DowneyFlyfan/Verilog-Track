@@ -1,12 +1,14 @@
 import numpy as np
+import math
 
 
 def to_hex(val, width):
     """Converts a signed integer to a two's complement hex string."""
     if val >= (1 << (width - 1)) or val < -(1 << (width - 1)):
         val = max(-(1 << (width - 1)), min(val, (1 << (width - 1)) - 1))
+    hex_chars = math.ceil(width / 4)
 
-    return format(val & (2**width - 1), f"0{width//4}x")
+    return format(val & (2**width - 1), f"0{hex_chars}x")
 
 
 def write_to_file(data, filename, width):
